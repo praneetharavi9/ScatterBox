@@ -1,23 +1,21 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
 
-// Category is now a plain string so custom lists work the same as built-ins
 export type Category = string;
 
 export interface Entry {
   id: string;
   text: string;
-  category: Category | null; // null = pending AI categorization
+  category: Category | null;
   createdAt: Date;
 }
 
 export interface List {
-  id: string;       // used as the category key
+  id: string;
   name: string;
   color: string;
   isBuiltIn: boolean;
 }
-
-// ─── Built-in lists ───────────────────────────────────────────────────────────
 
 const BUILT_IN_LISTS: List[] = [
   { id: 'todo',      name: 'To-Do',      color: '#2196F3', isBuiltIn: true },
@@ -26,7 +24,6 @@ const BUILT_IN_LISTS: List[] = [
   { id: 'braindump', name: 'Brain Dump', color: '#FF9800', isBuiltIn: true },
 ];
 
-// Kept for backward compat with index.tsx badge rendering
 export const CATEGORY_LABELS: Record<string, string> = {
   groceries: 'Groceries',
   todo: 'To-Do',
@@ -41,21 +38,22 @@ export const CATEGORY_COLORS: Record<string, string> = {
   braindump: '#FF9800',
 };
 
-// Colors cycled through when creating custom lists
 const CUSTOM_COLORS = [
   '#E91E63', '#00BCD4', '#FF5722', '#607D8B',
   '#795548', '#009688', '#3F51B5', '#F44336',
 ];
 
-// ─── Context ──────────────────────────────────────────────────────────────────
-
 interface EntriesContextValue {
   entries: Entry[];
   lists: List[];
-  /** Add a new entry. Pass category to skip AI (manual add). Returns the new id. */
-  addEntry: (text: string, category?: Category) => string;
-  updateEntryCategory: (id: string, category: Category) => void;
-  addList: (name: string) => List;
+  loading: boolean;
+  addEntry: (text: string, category?: Category) => Promise<string>;
+  updateEntryCategory: (id: string, category: Category) => Promise<void>;
+  updateEntryText: (id: string, text: string) => Promise<void>;
+  deleteEntry: (id: string) => Promise<void>;
+  addList: (name: string) => Promise<List>;
+  renameList: (id: string, name: string) => Promise<void>;
+  deleteList: (id: string) => Promise<void>;
   getList: (id: string) => List | undefined;
 }
 
@@ -64,30 +62,143 @@ const EntriesContext = createContext<EntriesContextValue | null>(null);
 export function EntriesProvider({ children }: { children: React.ReactNode }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [lists, setLists] = useState<List[]>(BUILT_IN_LISTS);
+  const [loading, setLoading] = useState(true);
+  const [userId, setUserId] = useState<string | null>(null);
 
-  function addEntry(text: string, category?: Category): string {
-    const id = Date.now().toString();
-    setEntries(prev => [
-      { id, text, category: category ?? null, createdAt: new Date() },
-      ...prev,
-    ]);
-    return id;
+  const loadEntries = useCallback(async () => {
+    const { data } = await supabase
+      .from('entries')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (data) {
+      setEntries(data.map(row => ({
+        id: row.id,
+        text: row.text,
+        category: row.category ?? null,
+        createdAt: new Date(row.created_at),
+      })));
+    }
+  }, []);
+
+  const loadLists = useCallback(async () => {
+    const { data } = await supabase
+      .from('lists')
+      .select('*')
+      .order('created_at', { ascending: true });
+
+    if (data && data.length > 0) {
+      const customLists: List[] = data.map(row => ({
+        id: row.id,
+        name: row.name,
+        color: row.color,
+        isBuiltIn: false,
+      }));
+      setLists([...BUILT_IN_LISTS, ...customLists]);
+      customLists.forEach(l => {
+        CATEGORY_LABELS[l.id] = l.name;
+        CATEGORY_COLORS[l.id] = l.color;
+      });
+    } else {
+      setLists(BUILT_IN_LISTS);
+    }
+  }, []);
+
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserId(session?.user.id ?? null);
+      if (session) {
+        Promise.all([loadEntries(), loadLists()]).finally(() => setLoading(false));
+      } else {
+        setEntries([]);
+        setLists(BUILT_IN_LISTS);
+        setLoading(false);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, [loadEntries, loadLists]);
+
+  async function addEntry(text: string, category?: Category): Promise<string> {
+    if (!userId) throw new Error('Not authenticated');
+
+    const { data, error } = await supabase
+      .from('entries')
+      .insert({ text, category: category ?? null, user_id: userId })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    const entry: Entry = {
+      id: data.id,
+      text: data.text,
+      category: data.category ?? null,
+      createdAt: new Date(data.created_at),
+    };
+    setEntries(prev => [entry, ...prev]);
+    return data.id;
   }
 
-  function updateEntryCategory(id: string, category: Category) {
-    setEntries(prev => prev.map(e => (e.id === id ? { ...e, category } : e)));
+  async function updateEntryCategory(id: string, category: Category): Promise<void> {
+    const { error } = await supabase
+      .from('entries')
+      .update({ category })
+      .eq('id', id);
+
+    if (!error) {
+      setEntries(prev => prev.map(e => (e.id === id ? { ...e, category } : e)));
+    }
   }
 
-  function addList(name: string): List {
+  async function addList(name: string): Promise<List> {
+    if (!userId) throw new Error('Not authenticated');
+
     const customCount = lists.filter(l => !l.isBuiltIn).length;
     const color = CUSTOM_COLORS[customCount % CUSTOM_COLORS.length];
     const id = `custom-${Date.now()}`;
     const newList: List = { id, name: name.trim(), color, isBuiltIn: false };
+
+    // Optimistic update so the list appears immediately
     setLists(prev => [...prev, newList]);
-    // Keep label/color maps in sync for index.tsx badge
     CATEGORY_LABELS[id] = newList.name;
     CATEGORY_COLORS[id] = newList.color;
+
+    await supabase
+      .from('lists')
+      .insert({ id, name: name.trim(), color, user_id: userId });
+
     return newList;
+  }
+
+  async function updateEntryText(id: string, text: string): Promise<void> {
+    const { error } = await supabase.from('entries').update({ text }).eq('id', id);
+    if (!error) setEntries(prev => prev.map(e => (e.id === id ? { ...e, text } : e)));
+  }
+
+  async function deleteEntry(id: string): Promise<void> {
+    const { error } = await supabase.from('entries').delete().eq('id', id);
+    if (!error) setEntries(prev => prev.filter(e => e.id !== id));
+  }
+
+  async function deleteList(id: string): Promise<void> {
+    await supabase.from('entries').delete().eq('category', id);
+    setEntries(prev => prev.filter(e => e.category !== id));
+    await supabase.from('lists').delete().eq('id', id);
+    setLists(prev => prev.filter(l => l.id !== id));
+    delete CATEGORY_LABELS[id];
+    delete CATEGORY_COLORS[id];
+  }
+
+  async function renameList(id: string, name: string): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setLists(prev => prev.map(l => (l.id === id ? { ...l, name: trimmed } : l)));
+    CATEGORY_LABELS[id] = trimmed;
+    const list = lists.find(l => l.id === id);
+    if (list && !list.isBuiltIn) {
+      await supabase.from('lists').update({ name: trimmed }).eq('id', id);
+    }
   }
 
   function getList(id: string): List | undefined {
@@ -95,7 +206,7 @@ export function EntriesProvider({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <EntriesContext.Provider value={{ entries, lists, addEntry, updateEntryCategory, addList, getList }}>
+    <EntriesContext.Provider value={{ entries, lists, loading, addEntry, updateEntryCategory, updateEntryText, deleteEntry, addList, renameList, deleteList, getList }}>
       {children}
     </EntriesContext.Provider>
   );

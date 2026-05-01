@@ -1,7 +1,8 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   FlatList,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -18,17 +19,205 @@ import {
   CATEGORY_LABELS,
   CATEGORY_COLORS,
   type Entry,
+  type List,
 } from '@/context/entries-context';
+import { categorizeEntry } from '@/lib/categorize';
+
+// ─── Cluster detection ────────────────────────────────────────────────────────
+
+const STOP_WORDS = new Set([
+  // articles / prepositions / conjunctions
+  'the','a','an','and','or','but','nor','so','yet','for','with','from',
+  'into','to','in','on','at','by','up','about','that','this','these',
+  'those','than','then','when','where','which','who','whom','whose',
+  // pronouns
+  'i','me','my','we','our','you','your','he','she','it','its','they',
+  'them','their','us','him','her','his',
+  // common verbs (present / past / gerund)
+  'be','is','are','was','were','been','being',
+  'have','has','had','having',
+  'do','does','did','done','doing',
+  'go','goes','went','gone','going',
+  'get','gets','got','getting',
+  'make','makes','made','making',
+  'take','takes','took','taking',
+  'come','comes','came','coming',
+  'see','sees','saw','seen','seeing',
+  'need','needs','needed','needing',
+  'want','wants','wanted','wanting',
+  'use','uses','used','using',
+  'put','puts','putting',
+  'set','sets','setting',
+  'give','gives','gave','given','giving',
+  'try','tries','tried','trying',
+  'eat','eats','ate','eating',
+  'cook','cooks','cooked','cooking',
+  'buy','buys','bought','buying',
+  'add','adds','added','adding',
+  'create','creates','created','creating',
+  'build','builds','built','building',
+  'send','sends','sent','sending',
+  'call','calls','called','calling',
+  'work','works','worked','working',
+  'move','moves','moved','moving',
+  'help','helps','helped','helping',
+  'deal','deals','dealt',
+  'connect','remove','check',
+  // auxiliaries / modals
+  'will','would','could','should','shall','may','might','must','can',
+  // common adjectives / adverbs / fillers
+  'new','old','big','small','good','bad','just','also','now','not',
+  'still','very','really','more','most','some','any','all','both',
+  'each','few','no','up','down','out','off','over','under','again',
+  // app-specific noise
+  'list','tab','project','name','app','item','items','note','notes',
+  'task','tasks','people','person','time','day','week','today',
+]);
+
+function detectCluster(
+  entries: Entry[],
+  lists: List[],
+  dismissed: Set<string>,
+): { word: string; listName: string; entryIds: string[] } | null {
+  const existingNames = new Set(lists.map(l => l.name.toLowerCase()));
+  const wordToIds: Record<string, string[]> = {};
+
+  for (const entry of entries) {
+    const words = entry.text.toLowerCase().match(/\b[a-z]{3,}\b/g) ?? [];
+    const seen = new Set<string>();
+    for (const w of words) {
+      if (STOP_WORDS.has(w) || seen.has(w) || dismissed.has(w) || existingNames.has(w)) continue;
+      seen.add(w);
+      wordToIds[w] = wordToIds[w] ?? [];
+      wordToIds[w].push(entry.id);
+    }
+  }
+
+  const best = Object.entries(wordToIds)
+    .filter(([, ids]) => ids.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length)[0];
+
+  if (!best) return null;
+  const [word, entryIds] = best;
+  return { word, listName: word.charAt(0).toUpperCase() + word.slice(1), entryIds };
+}
+
+// ─── Suggestion banner ────────────────────────────────────────────────────────
+
+function SuggestionBanner({
+  suggestion,
+  isDark,
+  onAccept,
+  onDismiss,
+}: {
+  suggestion: { listName: string; entryIds: string[] };
+  isDark: boolean;
+  onAccept: () => void;
+  onDismiss: () => void;
+}) {
+  const bg = isDark ? '#1C2A3A' : '#EFF6FF';
+  const textColor = isDark ? '#93C5FD' : '#1D4ED8';
+  const mutedColor = isDark ? '#6B7280' : '#9CA3AF';
+
+  return (
+    <View style={[styles.suggestion, { backgroundColor: bg }]}>
+      <Text style={[styles.suggestionText, { color: textColor }]}>
+        Create a "{suggestion.listName}" list for {suggestion.entryIds.length} related entries?
+      </Text>
+      <View style={styles.suggestionActions}>
+        <Pressable onPress={onDismiss} style={styles.suggestionNo}>
+          <Text style={[styles.suggestionNoText, { color: mutedColor }]}>No</Text>
+        </Pressable>
+        <Pressable onPress={onAccept} style={styles.suggestionYes}>
+          <Text style={styles.suggestionYesText}>Yes, create it</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+// ─── Edit modal ───────────────────────────────────────────────────────────────
+
+function EditModal({
+  entry,
+  isDark,
+  onSave,
+  onDelete,
+  onClose,
+}: {
+  entry: Entry | null;
+  isDark: boolean;
+  onSave: (id: string, text: string) => void;
+  onDelete: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState(entry?.text ?? '');
+  const cardBg = isDark ? '#1E1E1E' : '#fff';
+  const textColor = isDark ? '#ECEDEE' : '#11181C';
+  const inputBg = isDark ? '#2A2A2A' : '#F5F5F5';
+  const inputBorder = isDark ? '#3A3A3A' : '#E5E7EB';
+  const placeholder = isDark ? '#4B5563' : '#9CA3AF';
+
+  if (!entry) return null;
+
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onClose}>
+      <Pressable style={styles.backdrop} onPress={onClose}>
+        <Pressable style={[styles.modalCard, { backgroundColor: cardBg }]} onPress={() => {}}>
+          <Text style={[styles.modalTitle, { color: textColor }]}>Edit entry</Text>
+          <TextInput
+            autoFocus
+            style={[styles.modalInput, { backgroundColor: inputBg, color: textColor, borderColor: inputBorder }]}
+            placeholderTextColor={placeholder}
+            value={text}
+            onChangeText={setText}
+            multiline
+            returnKeyType="default"
+          />
+          <View style={styles.modalActions}>
+            <Pressable
+              onPress={() => { onDelete(entry.id); onClose(); }}
+              style={styles.deleteBtn}>
+              <Text style={styles.deleteBtnText}>Delete</Text>
+            </Pressable>
+            <View style={styles.modalRight}>
+              <Pressable onPress={onClose} style={styles.cancelBtn}>
+                <Text style={[styles.cancelText, { color: placeholder }]}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => { if (text.trim()) { onSave(entry.id, text.trim()); onClose(); } }}
+                disabled={!text.trim()}
+                style={[styles.saveBtn, { backgroundColor: text.trim() ? '#2196F3' : (isDark ? '#3A3A3A' : '#E5E7EB') }]}>
+                <Text style={styles.saveBtnText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
 
 // ─── Entry card ───────────────────────────────────────────────────────────────
 
-function EntryCard({ entry, isDark }: { entry: Entry; isDark: boolean }) {
+function EntryCard({
+  entry,
+  isDark,
+  onLongPress,
+}: {
+  entry: Entry;
+  isDark: boolean;
+  onLongPress: () => void;
+}) {
   const cardBg = isDark ? '#1E1E1E' : '#F5F5F5';
   const textColor = isDark ? '#ECEDEE' : '#11181C';
   const mutedColor = isDark ? '#6B7280' : '#9CA3AF';
 
   return (
-    <View style={[styles.card, { backgroundColor: cardBg }]}>
+    <Pressable
+      onLongPress={onLongPress}
+      delayLongPress={400}
+      style={({ pressed }) => [styles.card, { backgroundColor: cardBg, opacity: pressed ? 0.7 : 1 }]}>
       <Text style={[styles.entryText, { color: textColor }]}>{entry.text}</Text>
       <View style={styles.cardFooter}>
         {entry.category ? (
@@ -47,7 +236,7 @@ function EntryCard({ entry, isDark }: { entry: Entry; isDark: boolean }) {
           {entry.createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </Text>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -78,20 +267,55 @@ export default function DumpScreen() {
   const text = Colors[isDark ? 'dark' : 'light'].text;
   const tint = Colors[isDark ? 'dark' : 'light'].tint;
 
-  const { entries, addEntry } = useEntries();
+  const { entries, lists, addEntry, updateEntryCategory, updateEntryText, deleteEntry, addList } = useEntries();
   const [inputText, setInputText] = useState('');
+  const [editingEntry, setEditingEntry] = useState<Entry | null>(null);
+  const [suggestion, setSuggestion] = useState<{ word: string; listName: string; entryIds: string[] } | null>(null);
+  const dismissedWords = useRef(new Set<string>());
   const listRef = useRef<FlatList>(null);
 
   const inputBg = isDark ? '#1E1E1E' : '#F5F5F5';
   const inputBorder = isDark ? '#2D2D2D' : '#E5E7EB';
   const placeholderColor = isDark ? '#4B5563' : '#9CA3AF';
 
-  function handleSubmit() {
+  useEffect(() => {
+    if (entries.length < 2) return;
+    const detected = detectCluster(entries, lists, dismissedWords.current);
+    setSuggestion(prev => {
+      if (!detected) return null;
+      if (prev?.word === detected.word) return prev;
+      return detected;
+    });
+  }, [entries, lists]);
+
+  async function handleAcceptSuggestion() {
+    if (!suggestion) return;
+    const list = await addList(suggestion.listName);
+    await Promise.all(suggestion.entryIds.map(id => updateEntryCategory(id, list.id)));
+    setSuggestion(null);
+  }
+
+  function handleDismissSuggestion() {
+    if (!suggestion) return;
+    dismissedWords.current.add(suggestion.word);
+    setSuggestion(null);
+  }
+
+  async function handleSubmit() {
     const trimmed = inputText.trim();
     if (!trimmed) return;
-    addEntry(trimmed);
     setInputText('');
-    // TODO: call Claude API to categorize, then call updateEntryCategory(id, category)
+    const id = await addEntry(trimmed);
+    categorizeEntry(trimmed, lists)
+      .then(async result => {
+        if (result.type === 'new') {
+          const list = await addList(result.name);
+          await updateEntryCategory(id, list.id);
+        } else {
+          await updateEntryCategory(id, result.id);
+        }
+      })
+      .catch(() => updateEntryCategory(id, 'braindump'));
   }
 
   return (
@@ -109,7 +333,23 @@ export default function DumpScreen() {
         ref={listRef}
         data={entries}
         keyExtractor={item => item.id}
-        renderItem={({ item }) => <EntryCard entry={item} isDark={isDark} />}
+        renderItem={({ item }) => (
+          <EntryCard
+            entry={item}
+            isDark={isDark}
+            onLongPress={() => setEditingEntry(item)}
+          />
+        )}
+        ListHeaderComponent={
+          suggestion ? (
+            <SuggestionBanner
+              suggestion={suggestion}
+              isDark={isDark}
+              onAccept={handleAcceptSuggestion}
+              onDismiss={handleDismissSuggestion}
+            />
+          ) : null
+        }
         contentContainerStyle={[
           styles.feedContent,
           entries.length === 0 && styles.feedContentEmpty,
@@ -154,6 +394,15 @@ export default function DumpScreen() {
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Edit modal */}
+      <EditModal
+        entry={editingEntry}
+        isDark={isDark}
+        onSave={(id, newText) => updateEntryText(id, newText)}
+        onDelete={id => deleteEntry(id)}
+        onClose={() => setEditingEntry(null)}
+      />
     </SafeAreaView>
   );
 }
@@ -186,6 +435,42 @@ const styles = StyleSheet.create({
   feedContentEmpty: {
     flex: 1,
   },
+  // Suggestion banner
+  suggestion: {
+    borderRadius: 12,
+    padding: 14,
+    gap: 10,
+    marginBottom: 4,
+  },
+  suggestionText: {
+    fontSize: 14,
+    fontWeight: '500',
+    lineHeight: 20,
+  },
+  suggestionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  suggestionNo: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+  },
+  suggestionNoText: {
+    fontSize: 14,
+  },
+  suggestionYes: {
+    backgroundColor: '#2196F3',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  suggestionYesText: {
+    color: '#fff',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  // Card
   card: {
     borderRadius: 12,
     padding: 14,
@@ -269,4 +554,57 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     lineHeight: 20,
   },
+  // Modal
+  backdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+  },
+  modalCard: {
+    width: '100%',
+    borderRadius: 16,
+    padding: 20,
+    gap: 14,
+  },
+  modalTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  modalInput: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 15,
+    minHeight: 80,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  modalRight: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'center',
+  },
+  deleteBtn: {
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+  },
+  deleteBtnText: {
+    color: '#EF4444',
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  cancelBtn: { paddingHorizontal: 4, paddingVertical: 6 },
+  cancelText: { fontSize: 15 },
+  saveBtn: {
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  saveBtnText: { color: '#fff', fontWeight: '600', fontSize: 15 },
 });
